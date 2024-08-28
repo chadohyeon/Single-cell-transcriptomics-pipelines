@@ -1,0 +1,920 @@
+---
+title: "seurat"
+output: html_document
+---
+### Data assembly
+
+```{r setup, include=FALSE}
+require(Seurat)
+require(dplyr)
+require(cowplot)
+require(ggplot2)
+require(patchwork)
+require(DoubletFinder)
+
+
+cellranger2Seurat=function(data_dir, project_name, species="human", min_cells=3, min_features=200){
+  require(Seurat); require(dplyr); require(ggplot2)
+  cellrangerCounts=Read10X(data.dir = data_dir)
+  obj=CreateSeuratObject(counts = cellrangerCounts, project = project_name, min.cells = min_cells, min.features = min_features)
+  if (species=="human"){
+    mitoPattern="^MT-"
+  }else if (species=="mouse"){
+    mitoPattern="^mt-"
+  }
+  else{
+    mitoPattern="^MT-"
+  }
+  obj$percent.mt <- PercentageFeatureSet(obj, pattern = mitoPattern)
+  return(obj)
+}
+
+moghe.219.obj = cellranger2Seurat(data_dir="/home/ryuny43/Moghe/01.cellrangerCount/Sample_219/outs/filtered_feature_bc_matrix",project_name = "Moghe_Sample219", species="human")
+
+moghe.340.obj = cellranger2Seurat(data_dir="/home/ryuny43/Moghe/01.cellrangerCount/Sample_340/outs/filtered_feature_bc_matrix",project_name = "Moghe_Sample340",  species="human")
+```
+
+### Doublet detection and filtering using DoubletFInder
+```{r}
+doubletFinderRun=function(obj, ndim=20){
+  require(dplyr); require(ggplot2); require(DoubletFinder); require(Seurat)
+  obj = obj %>% NormalizeData(.) %>%
+    FindVariableFeatures(., selection.method = "vst", nfeatures = 2000) %>%
+    ScaleData(.) %>% RunPCA(., npcs=ndim) %>% FindNeighbors(., dims=1:ndim) %>%
+    FindClusters(., resolution = 1.0) %>% RunUMAP(., dims = 1:ndim)
+  
+  DimPlot(obj, reduction = 'umap', label =TRUE) %>% print(.)
+  
+  ## pK Identification 
+  sweep.res.list = paramSweep_v3(obj, PCs = 1:ndim, sct = FALSE)
+  sweep.stats = summarizeSweep(sweep.res.list, GT = FALSE)
+  bcmvn <- find.pK(sweep.stats)
+  bcmvn %>% ggplot(.,aes(x=pK, y=BCmetric, group=1))+geom_point()+geom_line() %>% print(.)
+  pK_optimal=(bcmvn %>% arrange(desc(BCmetric)))$pK[[1]] %>% as.character() %>% as.numeric()
+  
+  obj$clustersBeforeDoubletFinder <- Idents(obj)
+  annotation <- obj@meta.data$clustersBeforeDoubletFinder
+  
+  ## Homotypic Doublet proportion estimate
+  homotypic.prop <- modelHomotypic(annotation)
+  
+  expectedDoubletRate=nrow(obj@meta.data)*0.000007589+0.0005272
+  nExp_poi <- round(expectedDoubletRate*nrow(obj@meta.data))
+  nExp_poi.adj <- round(nExp_poi*(1-homotypic.prop))
+  
+  doubletFinderColnames=c(colnames(obj@meta.data), "pANN", "DF.classifications_1")
+  
+  obj = doubletFinder_v3(obj, PCs = 1:ndim, pN = 0.25, pK = pK_optimal, nExp = nExp_poi, reuse.pANN = FALSE, sct = FALSE)
+  colnames(obj@meta.data)=doubletFinderColnames
+
+  obj = doubletFinder_v3(obj, PCs = 1:ndim, pN = 0.25, pK = pK_optimal, nExp = nExp_poi.adj, reuse.pANN = "pANN", sct = FALSE)
+  colnames(obj@meta.data)=c(doubletFinderColnames, "DF.classifications")
+  
+  table(obj$DF.classifications) %>% print(.)
+  DimPlot(obj, reduction = "umap", group.by = "DF.classifications") %>% print(.)
+  
+  obj$RNA_snn_res.1=NULL
+  obj$seurat_clusters=NULL
+  obj$pANN=NULL
+  obj$DF.classifications_1=NULL
+  
+  return(obj)
+}
+
+moghe.219.obj=doubletFinderRun(moghe.219.obj)
+save(moghe.219.obj, file = "/home/ryuny43/Moghe/02.seuratObjects/moghe.219.RData")
+
+moghe.340.obj = doubletFinderRun(moghe.340.obj)
+save(moghe.340.obj, file = "/home/ryuny43/Moghe/02.seuratObjects/moghe.340.RData")
+```
+
+
+### QC based on sample metrics
+```{r}
+qcPlot=function(obj, group_by=NULL){
+  require(dplyr); require(ggplot2); require(Seurat)
+  for (i in c("nFeature_RNA", "nCount_RNA", "percent.mt")) {
+    if (is.null(group_by)){
+      vlnPlot=obj@meta.data %>% ggplot(., aes(x=orig.ident, y=.[[i]]))
+    }else{
+      vlnPlot=obj@meta.data %>% ggplot(., aes(x=orig.ident, y=.[[i]], colour=.[[group_by]]))
+    }
+    vlnPlot=vlnPlot+geom_violin(alpha=0.4, position = position_dodge(width = .75),size=1)+geom_boxplot(alpha=0.4, position = position_dodge(width = .75),size=1,ch=TRUE, width = 0.3)+geom_jitter(size=0.4, alpha=0.3)+xlab(obj@project.name)+ylab(i)+scale_y_continuous(n.breaks=20)
+    print(vlnPlot)
+  }
+  obj %>% FeatureScatter(., feature1 = "nCount_RNA", feature2 = "percent.mt", group.by=group_by) %>% print(.)
+  obj %>% FeatureScatter(., feature1 = "nCount_RNA", feature2 = "nFeature_RNA", group.by=group_by) %>% print(.)
+}
+
+moghe.219.obj %>% qcPlot(.)
+moghe.340.obj %>% qcPlot(.)
+
+moghe.219.obj %>% qcPlot(., group_by="DF.classifications")
+moghe.340.obj %>% qcPlot(., group_by="DF.classifications")
+```
+
+### Filtering cells under supervised manners
+```{r}
+moghe.219.filtered = subset(moghe.219.obj, subset = nFeature_RNA > 500 & nFeature_RNA < 6000 & percent.mt < 5 & DF.classifications=="Singlet")
+save(moghe.219.filtered, file = "/home/ryuny43/Moghe/02.seuratObjects/moghe.219.filtered.RData")
+
+moghe.340.filtered = subset(moghe.340.obj, subset = nFeature_RNA > 500 & nFeature_RNA < 6000 & percent.mt < 5 & DF.classifications=="Singlet")
+save(moghe.340.filtered, file = "/home/ryuny43/Moghe/02.seuratObjects/moghe.340.filtered.RData")
+```
+
+### Multiplet Rate
+```{r}
+require(dplyr); require(ggplot2)
+cellRecovered=c(500,1000,2000,3000,4000,5000,6000,7000,8000,9000,10000)
+multiRate=c(0.4,0.8,1.6,2.3,3.1,3.9,4.6,5.4,6.1,6.9,7.6)
+
+lm(multiRate~cellRecovered) %>% summary(.)
+
+bind_cols(cellRecovered, multiRate)  %>% as.data.frame() %>% setNames(c("X","Y")) %>% ggplot(., aes(x=X, y=Y))+geom_point()
+```
+
+###  CellCycleRegression + Harmony + Downstream analysis with Harmonized PCs
+```{r}
+cellCycleGenes=function(species="human"){
+  require(AnnotationHub); require(ensembldb); require(dplyr)
+  ah = AnnotationHub()
+  if (species=="human"){
+    cell_cycle_genes <- read.csv("/home/public/ref/00_Ref_GRCh38/annot/human.cellCycleGenes.hbc.tinyatlas.csv")
+    ahDb = query(ah, pattern = c("Homo sapiens", "EnsDb"), ignore.case = TRUE)
+  }else if (species=="mouse"){
+    cell_cycle_genes <- read.csv("/home/public/ref/00_Ref_mm10/annot/mouse.cellCycleGenes.hbc.tinyatlas.csv")
+    ahDb = query(ah, pattern = c("Mus musculus", "EnsDb"), ignore.case = TRUE)
+  }
+  
+  print("Acquire the latest annotation files")
+  id = ahDb %>% mcols() %>% rownames() %>% tail(1)
+  
+  print("Download the appropriate Ensembldb database")
+  edb <- ah[[id]]
+  
+  print("Extract gene-level information from database")
+  annotations <- genes(edb,return.type = "data.frame")
+  annotations <- annotations %>% dplyr::select(gene_id, gene_name, seq_name, gene_biotype, description)
+  
+  print("Get gene names for Ensembl IDs for each gene")
+  cell_cycle_markers <- left_join(cell_cycle_genes, annotations, by = c("geneID" = "gene_id"))
+  
+  print("Acquire the S phase genes")
+  s_genes <- cell_cycle_markers %>% dplyr::filter(phase == "S") %>% pull("gene_name")
+  
+  print("Acquire the G2M phase genes")        
+  g2m_genes <- cell_cycle_markers %>% dplyr::filter(phase == "G2/M") %>%  pull("gene_name")
+  return(list(s_genes,g2m_genes))
+}
+
+runSeuratPCA=function(obj, ndim=10, species="human", cellCycleRegress=TRUE, showCellCyclePlots=FALSE){
+  require(dplyr); require(Seurat)
+  ### Log-normalization, Highly variable gene detection
+  obj = obj %>% NormalizeData(.) %>% FindVariableFeatures(., selection.method = "vst", nfeatures = 2000)
+  if (cellCycleRegress){
+      cellCycleGenesList=cellCycleGenes(species)
+      s_genes=cellCycleGenesList[[1]]
+      g2m_genes=cellCycleGenesList[[2]]
+      
+      obj <- CellCycleScoring(obj, s.features = s_genes, g2m.features = g2m_genes)
+      if (showCellCyclePlots){
+        print("1. Cell-cycle not-adjusted PC dimension plot")
+        obj %>% ScaleData(.) %>% RunPCA(., features = c(s_genes, g2m_genes), npcs = ndim) %>% DimPlot(., reduction="pca", group.by = "Phase") %>% print(.)
+      
+        print("2. Cell-cycle adjusted PC dimension plot")
+        obj = obj %>% ScaleData(., vars.to.regress=c("S.Score", "G2M.Score"))
+        obj %>% RunPCA(., features = c(s_genes, g2m_genes), npcs = ndim) %>% DimPlot(., reduction="pca", group.by = "Phase") %>% print(.)
+      }else{
+        obj = obj %>% ScaleData(., vars.to.regress=c("S.Score", "G2M.Score"))
+      }
+  }else {
+      obj = obj %>% ScaleData(.)
+  }
+  
+  ### Run PCA
+  obj = obj %>% RunPCA(., npcs = ndim)
+  obj %>% ElbowPlot(.) %>% print(.)
+  return(obj)
+}
+
+
+runSeuratUMAP=function(obj, ndim=10, louvainResolution=1.0){
+    require(dplyr); require(Seurat)
+    obj = obj %>% RunUMAP(reduction = "harmony", dims = 1:ndim) %>% 
+    FindNeighbors(reduction = "harmony", dims = 1:ndim) %>% 
+    FindClusters(resolution = louvainResolution) %>% 
+    identity()
+    return(obj)
+}
+
+wrapperRunHarmony=function(data_vector,project_name="harmonyMerged", species="human", ndim=10, louvainResolution=1.0, cellCycleRegress=TRUE, showCellCyclePlots=FALSE){
+  require(harmony); require(dplyr); require(Seurat)
+  cellIDs = data_vector %>% lapply(., function(x) x@project.name) %>% as.character()
+  obj1=data_vector[[1]]
+  obj2=data_vector[2:length(data_vector)]
+  merged.obj = merge(obj1, y = obj2, add.cell.ids = cellIDs, project = project_name)
+  
+  merged.obj = runSeuratPCA(merged.obj, ndim, species, cellCycleRegress, showCellCyclePlots)
+  merged.obj$subjects = merged.obj$orig.ident
+  
+  merged.obj %>% DimPlot(object = ., reduction = "pca", group.by = "subjects", pt.size = .1) %>% print(.)
+   merged.obj %>% VlnPlot(object = ., features = "PC_1", group.by = "subjects", pt.size = 0) %>% print(.)
+  
+  merged.obj <- merged.obj %>% 
+    RunHarmony("subjects", plot_convergence = TRUE)
+  
+  merged.obj %>% DimPlot(object = ., reduction = "harmony", group.by = "subjects", pt.size = .1) %>% print(.)
+  merged.obj %>% VlnPlot(object = ., features = "harmony_1", group.by = "subjects", pt.size = 0) %>% print(.)
+  
+  # Downstream analysis
+  merged.obj = runSeuratUMAP(merged.obj, ndim, louvainResolution)
+  
+  merged.obj %>% DimPlot(., reduction = "umap",label = TRUE, pt.size = .1) %>% print(.)
+  merged.obj %>% DimPlot(., reduction = "umap",group.by = "subjects",label = TRUE, pt.size = .1) %>% print(.)
+  return(merged.obj)
+}
+
+#load("/home/ryuny43/Moghe/02.seuratObjects/moghe.219.filtered.RData")
+#load("/home/ryuny43/Moghe/02.seuratObjects/moghe.340.filtered.RData")
+
+toHarmony=c(moghe.219.filtered, moghe.340.filtered)
+
+#moghe.harmony.cellCycleReg.pc15=wrapperRunHarmony(data_vector = toHarmony, project_name = "MOGHE", ndim=15, louvainResolution=1.0, cellCycleRegress=TRUE, showCellCyclePlots=TRUE)
+#moghe.harmony.pc15=wrapperRunHarmony(data_vector = toHarmony, project_name = "MOGHE", ndim=15, louvainResolution=1.0, cellCycleRegress=FALSE)
+
+moghe.harmony.cellCycleReg.pc15.res_2.0=wrapperRunHarmony(data_vector = toHarmony, project_name = "MOGHE", ndim=15, louvainResolution=2.0, cellCycleRegress=TRUE)
+save(moghe.harmony.cellCycleReg.pc15.res_2.0, file = "/home/ryuny43/Moghe/02.seuratObjects/moghe.harmony.cellCycleReg.pc15.res_2.0.RData")
+
+#save(moghe.harmony.pc15, file = "/home/ryuny43/Moghe/02.seuratObjects/moghe.harmony.pc15.RData")
+#save(moghe.harmony.cellCycleReg.pc15, file = "/home/ryuny43/Moghe/02.seuratObjects/moghe.harmony.cellCycleReg.pc15.RData")
+
+```
+
+### PC-influencing genes + Manual feature plots
+```{r}
+require(Seurat); require(ggplot2); require(dplyr); require(tibble)
+
+#moghe.harmony.cellCycleReg.pc15 %>% VizDimLoadings(., dim=1:4, reduction="harmony")
+#moghe.harmony.cellCycleReg.pc15 %>% DimHeatmap(., dims = 1:6, cells = 500, balanced = TRUE, reduction="harmony")
+
+#harmonyN=4
+#harm=moghe.harmony.cellCycleReg.pc15@reductions$harmony@feature.loadings %>% .[,harmonyN]
+#harm_abs=abs(harm)
+#harm_influence=bind_cols(names(harm), harm, harm_abs) %>% as.data.frame() %>% setNames(c("gene",paste0("harmony",harmonyN), "harmony_abs")) %>% arrange(desc(harmony_abs)) %>% tibble::column_to_rownames("gene")
+
+#moghe.harmony.cellCycleReg.pc15 %>% VizDimLoadings(., dim=1:4, reduction="harmony")
+#moghe.harmony.cellCycleReg.pc15 %>% DimHeatmap(., dims = 1:6, cells = 500, balanced = TRUE, reduction="harmony")
+
+obj=moghe.harmony.cellCycleReg.pc15
+
+featurePlotAll=function(obj, gene_list){
+  require(Seurat)
+  p=FeaturePlot(object = obj, features = gene_list, ncol=length(gene_list), min.cutoff = "q10", max.cutoff = "q90") + NoLegend() + NoAxes()
+  p %>% print(.)
+}
+
+
+geneList=
+c("RGS5","KCNJ8","HIGD1B","VTN","TBX18","COL1A1")
+featurePlotAll(obj, geneList)
+#obj %>% DimPlot(., reduction="umap")
+
+#clustermarkers <- FindAllMarkers(object = moghe.harmony.cellCycleReg.pc15, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+```
+
+
+### Marker gene expression
+```{r}
+setwd("/home/ryuny43/Moghe")
+### Naive DEG (specific Louvain cluster N to others all, Wilcoxon)
+
+
+#clustermarkers_wilcox <- FindAllMarkers(object = moghe.harmony.cellCycleReg.pc15, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+#clustermarkers_res_1.5_wilcox <- FindAllMarkers(object = moghe.harmony.cellCycleReg.pc15.res_1.5, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+# 1.2 FC
+clustermarkers_res_2.0_wilcox <- FindAllMarkers(object = moghe.harmony.cellCycleReg.pc15.res_2.0, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+topN_markers_to_write=function(markersDF, topN=5, fn, obj){
+  require(dplyr)
+  top_markers <- markersDF %>% dplyr::filter(!str_detect(gene, "^MT")) %>% dplyr::filter(!str_detect(gene, "^AC[0-9]")) %>% dplyr::filter(!str_detect(gene, "^AL[0-9]")) %>% dplyr::filter(!str_detect(gene, "[A-Z0-9]-[A-Z]"))%>% group_by(cluster) %>% top_n(n = topN, wt = avg_log2FC)
+  hmap=DoHeatmap(subset(obj, downsample = 200), features = unique(top_markers$gene), angle = 90, label = FALSE) +  NoLegend()
+  hmap %>% print(.)
+  write.table(top_markers, file = paste0(fn,"_top",topN,".txt"), sep="\t")
+  return(top_markers)
+}
+
+topN_markers_to_write(clustermarkers_res_2.0_wilcox, topN=5, fn="wilcox_res2.0_Clusters", moghe.harmony.cellCycleReg.pc15.res_2.0)
+topN_markers_to_write(clustermarkers_res_2.0_wilcox, topN=100, fn="wilcox_res2.0_Clusters", moghe.harmony.cellCycleReg.pc15.res_2.0) 
+
+```
+
+# Annotation and Basic Visualization
+```{r}
+obj <- cmt
+
+cmt <- RenameIdents(cmt, `Control_R1` = "Control", `Control_R2` = "Control", `Control_R3` = "Control", `Early Phase_R1` = "Early Phase", `Early Phase_R2` = "Early Phase", `Early Phase_R3` = "Early Phase", `Intermediate Phase_R1` = "Intermediate Phase", `Intermediate Phase_R2` = "Intermediate Phase", `Intermediate Phase_R3` = "Intermediate Phase", `Intermediate Phase_R4` = "Intermediate Phase", `Intermediate Phase_R5` = "Intermediate Phase", `Late Phase_R1` = "Late Phase", `Late Phase_R2` = "Late Phase", `Late Phase_R3` = "Late Phase", `Tumor_R1` = "Tumor", `Tumor_R2` = "Tumor", `Tumor_R3` = "Tumor")
+
+DimPlot(obj, reduction = "umap", label = TRUE, label.size = 4) + NoAxes() + NoLegend() 
+DimPlot(obj, reduction = 'umap', group.by = "orig.ident") + NoAxes() 
+DimPlot(obj, reduction = "umap") + NoAxes() 
+DimPlot(obj, reduction = 'umap', split.by = "orig.ident") + theme(text = element_text(size = 15)) +NoLegend()
+FeaturePlot(object= obj, reduction = "umap", features= "nCount_RNA")
+FeaturePlot(object= obj, reduction = "umap", features= "nFeature_RNA")
+FeaturePlot(object= obj, reduction = "umap", features= "percent.mt")
+FeaturePlot(object= obj, reduction = "umap", features="EGFRvIII") + NoLegend() 
+
+FeaturePlot(object = obj, features = c("Thbs4", "Ascl1"), ncol =3, min.cutoff = "q10", max.cutoff = "q90") + NoLegend() + NoAxes()
+
+FeaturePlot(object = obj, features = c("Slc1a3", "Aqp4", "Cldn10"), ncol =3, min.cutoff = "q10", max.cutoff = "q90") + NoLegend() + NoAxes()
+FeaturePlot(object = obj, features = c("Dlx1", "Sox11", "Ascl1"), ncol =3, min.cutoff = "q10", max.cutoff = "q90") 
+FeaturePlot(object = obj, features = c("Nrep", "Eomes", "Dcx"), ncol =3, min.cutoff = "q10", max.cutoff = "q90") + NoLegend() + NoAxes()
+
+FeaturePlot(object = obj, features = c("Syt1", "Pcp4", "Penk"), ncol =3, min.cutoff = "q10", max.cutoff = "q90") 
+
+FeaturePlot(object = obj, features = c("Mbp", "Mog"), ncol =3, min.cutoff = "q10", max.cutoff = "q90") + NoLegend() + NoAxes()
+FeaturePlot(object = obj, features = c("Opalin", "Klk6"), ncol =3, min.cutoff = "q10", max.cutoff = "q90") + NoLegend() + NoAxes()
+FeaturePlot(object = obj, features = c("Gpr17", "Fyn", "Tnr"), ncol =3, min.cutoff = "q10", max.cutoff = "q90") + NoLegend() + NoAxes()
+FeaturePlot(object = obj, features = c("Cspg4", "Lhfpl3", "Cdo1"), ncol =3, min.cutoff = "q10", max.cutoff = "q90") + NoLegend() + NoAxes()
+
+FeaturePlot(object = obj, features = c("Ccdc153", "Foxj1", "Enkur"), ncol =3, min.cutoff = "q10", max.cutoff = "q90") + NoLegend() + NoAxes()
+
+FeaturePlot(object = obj, features = c("Cldn5", "Flt1", "Egfl7"), ncol =3, min.cutoff = "q10", max.cutoff = "q90")
+FeaturePlot(object = obj, features = c("Vtn", "Kcnj8", "Acta2"), ncol =3, min.cutoff = "q10", max.cutoff = "q90")
+FeaturePlot(object = obj, features = c("Tmem119", "P2ry12", "Cx3cr1"), ncol =3, min.cutoff = "q10", max.cutoff = "q90")
+FeaturePlot(object = obj, features = c("Pf4", "Mrc1", "Plac8"), ncol =3, min.cutoff = "q10", max.cutoff = "q90")
+FeaturePlot(object = obj, features = c("Prom1", "Ssea", "Cd44", "A2b5", "Sox2", "Oct4", "Nanog", "Abcg2"), min.cutoff = "q10", max.cutoff = "q90")
+
+# Additional ploting methods
+plots <- FeaturePlot(pbmc_small, features = c('MS4A1', 'LYZ'), combine = FALSE)
+plots[[3]] + NoLegend()  # Get just the co-expression plot, built-in legend is meaningless for this plot
+plots[[4]] # Get just the key
+CombinePlots(plots[3:4], legend = 'none') # Stitch the co-expression and key plots together
+
+
+```
+
+# Additional visualization
+```{r}
+####### Stacked barplot
+obj$seurat_clusters <- obj$RNA_snn_res.1
+Idents(obj) <- obj$RNA_snn_res.1
+
+ggplot(obj@meta.data, aes(x=RNA_snn_res.1, fill=orig.ident)) + geom_bar(position = "fill") + theme(text = element_text(size = 15))
+
+ggplot(obj@meta.data, aes(x=RNA_snn_res.1, fill= Idents(obj))) + geom_bar(position = "fill") + theme(text = element_text(angle = 90, size = 15)) + theme(panel.background = element_blank()) + theme(axis.line = element_line(colour = "black")) 
+
+Idents(obj) <- obj$seurat_clusters 
+table(obj@active.ident, obj@meta.data$orig.ident)
+
+#######################################################################
+## Make subset of cells expressing EGFRvIII
+mut <- subset(obj, subset = EGFRvIII > 0)
+## Get cell names
+cellnames <- rownames(mut@meta.data)
+## Mutate a column in original metadata
+obj$barcode <- rownames(obj@meta.data)
+obj@meta.data <- obj@meta.data %>% mutate(EGFRvIII = ifelse((obj$barcode %in% cellnames), "Pos", "Neg"))
+
+Idents(obj) <- obj$EGFRvIII
+ggplot(obj@meta.data, aes(x=celltype, fill= Idents(obj))) + geom_bar(position = "fill") + theme(text = element_text(size = 15)) + theme(panel.background = element_blank()) + theme(axis.line = element_line(colour = "black"))+ theme(axis.text.x = element_text(angle=60, hjust=1, size = 10), axis.text.y = element_text(size = 10))
+
+table(Idents(obj), obj$batch) 
+
+table(obj@active.ident, obj@meta.data$seurat_clusters)
+
+save(mut, file = "mut_only.RData")
+
+Idents(mut) <- mut$celltype
+DimPlot(mut, reduction = "umap", label = TRUE, label.size = 8) + NoAxes() 
+
+Idents(mut) <- mut$orig.ident
+table(Idents(mut))
+mut.pos <- subset(mut.pos, idents = c("Early Phase", "Intermediate Phase", "Late Phase", "Tumor"))
+
+save(mut.pos, file = "mut_pos.RData")
+ggplot(mut.pos@meta.data, aes(x=RNA_snn_res.1, fill= orig.ident)) + geom_bar(position = "fill") + theme(text = element_text(size = 15)) + theme(panel.background = element_blank()) + theme(axis.line = element_line(colour = "black")) 
+
+#DF <- DF %>% group_by(Condition, Cell_Type) %>% 
+#  summarise(Nb = n()) %>%
+#  mutate(C = sum(Nb)) %>%
+#  mutate(percent = Nb/C*100)
+
+#ggplot(DF, aes(x = Condition, y = percent, fill = Cell_Type))+
+#geom_bar(stat = "identity")+
+#  geom_text(aes(label = paste(percent,"%")), position = position_stack(vjust = 0.5))
+
+Idents(mut.pos) <- mut.pos$RNA_snn_res.1
+table(Idents(mut.pos))
+mut.pos <- subset(mut.pos, idents = c("Early Phase", "Intermediate Phase", "Late Phase", "Tumor"))
+
+
+#######################################################################
+Idents(obj) <- obj$RNA_snn_res.1
+
+#Finding differentially expressed features (cluster biomarkers)
+cluster.markers <- FindAllMarkers(object = obj, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+top5 <- cluster.markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_logFC)
+top5
+
+write.csv(cluster.markers, file = "cmt_clustermarkers.csv")
+write.csv(top5, file = "cmt_top5.csv")
+
+cmt <- obj 
+save(cmt, file = "cmt_markers.RData")
+
+
+#######################################################################
+# visualization
+markers.to.plot = c("Aqp4", "Cldn10", "Thbs4", "Ascl1", "Dlx2", "Sox11", "Dcx", "Meg3", "Syt1", "Cspg4", "Lhfpl3", "Tnr", "Gpr17", "Mbp", "Mog", "Foxj1", "Ccdc153", "Cldn5", "Flt1", "Vtn", "Acta2", "Kcnj8", "Pf4", "Mrc1", "P2ry12", "Tmem119", "Lum", "Slc6a13")
+
+DotPlot(obj.final, features = markers.to.plot, cols = c("blue", "red"), dot.scale = 5) + RotatedAxis() +  theme_bw() +
+  theme(axis.text.x = element_text(angle=60, hjust=1, size = 10), axis.text.y = element_text(size = 10),
+        panel.grid.major.y = element_blank(),
+        panel.grid.major.x = element_blank())
+
+
+DotPlot(obj, features = markers.to.plot, cols = c("blue", "red"), dot.scale = 5) + RotatedAxis() + coord_flip() 
++ theme_bw() +
+  theme(axis.text.x = element_text(angle=60, hjust=1, size = 10), axis.text.y = element_text(size = 10),
+        panel.grid.major.y = element_blank(),
+        panel.grid.major.x = element_blank())
+
+
+markers.to.plot <- unique(markers.to.plot)
+
+obj@active.ident <- factor(x = obj@active.ident, levels = c("16", "3", "23", "8", "31", "6", "21", "33",  
+                                                            "18", "29", "32", "14", "26", "0", "1", "27", "15", "2", "25", "30", 
+                                                            "28", "4", "11", "24", "34", "19", "20", "22", 
+                                                            "9", "13", "17", "7", "10", "12", "5"))
+
+
+########################################################
+```
+
+## cluster annotation
+```{r}
+# Remove clusters with 0.2% of total cells (< 120 cells)
+# remove clusters with 0.4% of total cells
+
+Idents(obj) <- obj$RNA_snn_res.1
+obj <- RenameIdents(obj, `0` = "NSC", `1` = "PC", `2` = "NB", 
+                           `3` = "NSC", `4` = "TC-3", `5` = "MAC", `6` = "MG", `7` = "NSC", 
+                           `8` = "TC-1", `9` = "OL", `10` = "MG", `11` = "NTC-1", 
+                           `12` = "OL", `13` = "MG", `14` = "TAM-2", `15` = "VSMC", 
+                           `16` = "TC-5", `17` = "OL", `18` = "NTC-2", `19` = "EC", 
+                           `20` = "TC-2", `21` = "EC", `22` = "TAC", `23` = "EC", 
+                           `24` = "TAC", `25` = "NB", `26` = "OPC", `27` = "TAM-1",
+                           `28` = "Meninges", `29` = "COP", `30` = "Neuron", 
+                           `31` = "TC-4", `32` = "EPC")
+ obj <- RenameIdents(obj, 'PMC-1' = "pre-CC1", 'PMC-2' = "pre-CC2", 'MC-1' = "CC1", 'MC-2' = "CC2", 'MC-3' = "CC3", 'MC-4' = "CC4", 'MC-5' = "CC5")
+ obj <- RenameIdents(obj, 'NTC-1' = "pre-CC1", 'NTC-2' = "pre-CC2", 'TC-1' = "CC1", 'TC-2' = "CC2", 'TC-3' = "CC3", 'TC-4' = "CC4", 'TC-5' = "CC5")
+
+obj@active.ident <- factor(x = obj@active.ident, 
+                                  levels = c("NSC", "TAC", "NB", "Neuron",
+                                             "OPC", "COP", "OL", "pre-CC1", "pre-CC2",
+                                             "CC1", "CC2","CC3", "CC4", "CC5", "EPC",
+                                             "EC", "PC", "VSMC", "MAC", "MG", "TAM-1", 
+                                             "TAM-2", "Meninges")) 
+ 
+obj@active.ident <- factor(x = obj@active.ident, 
+                                  levels = c("pre-CC1", "pre-CC2",
+                                             "CC1", "CC2","CC3", "CC4", "CC5", 
+                                             "NSC", "TAC", "NB", "Neuron",
+                                             "OPC", "COP", "OL", "EPC",
+                                             "EC", "PC", "VSMC", "MAC", "MG", "TAM-1", 
+                                             "TAM-2", "Meninges")) 
+ 
+obj$celltype <- Idents(obj)
+
+DimPlot(obj, group.by = c("celltype", "orig.ident"))
+
+save(obj, file = "obj.RData")
+
+
+
+```
+
+
+```{r}
+#without dims, feature with variable genes (2000) will be used to draw a dendrogram
+obj <- BuildClusterTree(obj, dims = 1:7, slot="data", reorder.numeric = FALSE)
+
+PlotClusterTree(obj)
+
+
+obj <- BuildClusterTree(obj, features = VariableFeatures(obj), slot="data", reorder.numeric = FALSE)
+
+```
+
+
+
+
+# Find markers
+```{r}
+
+#Before we start our marker identification we will explicitly set our default assay, we want to use the original counts and not the integrated data.
+DefaultAssay(seurat.obj) <- "RNA"
+markers <- FindConservedMarkers(seurat.obj, ident.1 = "pre-CC1", grouping.var = "orig.ident",
+                     only.pos = TRUE, min.diff.pct = 0.25, min.pct = 0.25, logfc.threshold = 0.25)
+
+markers2 <- FindConservedMarkers(seurat.obj, ident.1 = "pre-CC2", grouping.var = "orig.ident",
+                     only.pos = TRUE, min.diff.pct = 0.25, min.pct = 0.25, logfc.threshold = 0.25)
+
+markers3 <- FindConservedMarkers(seurat.obj, ident.1 = "pre-CC2", grouping.var = "orig.ident",
+                     only.pos = TRUE, min.diff.pct = 0.25, min.pct = 0.25, logfc.threshold = 0.25)
+
+
+
+
+
+
+precc1.markers <- FindMarkers(seurat.obj, ident.1 = "pre-CC1", ident.2 = NULL, only.pos = TRUE)
+precc2.markers <- FindMarkers(seurat.obj, ident.1 = "pre-CC2", ident.2 = NULL, only.pos = TRUE)
+immaturOL.markers <- FindMarkers(seurat.obj, ident.1 = c("OPC", "COP"), ident.2 = NULL, only.pos = TRUE)
+cc.markers <- FindMarkers(seurat.obj, ident.1 = c("CC1", "CC2", "CC3", "CC4", "CC5"), ident.2 = NULL, only.pos = TRUE)
+
+precc1.nb.markers <- FindMarkers(seurat.obj, ident.1 = "pre-CC1", ident.2 = NULL, test.use = "negbinom")
+precc2.nb.markers <- FindMarkers(seurat.obj, ident.1 = "pre-CC2", ident.2 = NULL, test.use = "negbinom")
+immaturOL.nb.markers <- FindMarkers(seurat.obj, ident.1 = c("OPC", "COP"), ident.2 = NULL,test.use = "negbinom")
+cc.nb.markers <- FindMarkers(seurat.obj, ident.1 = c("CC1", "CC2", "CC3", "CC4", "CC5"), ident.2 = NULL, test.use = "negbinom")
+
+write.csv(precc1.nb.markers, file = "precc1_nb_markers.csv")
+write.csv(precc2.nb.markers, file = "precc2_nb_markers.csv")
+write.csv(immaturOL.nb.markers, file = "immatureOL_nb_markers.csv")
+write.csv(cc.nb.markers, file = "cc_nb_markers.csv")
+
+Idents(obj.sub) <- obj.sub$orig.ident
+
+early <- subset(obj.sub, idents = "Early Phase")
+intermediate <-subset(obj.sub, idents = "Intermediate Phase")                                     
+                                    
+precc1.markers <- FindMarkers(object = seurat.obj, ident.1="pre-CC1", ident.2= c("OPC", "COP"), min.pct = 0.25, logfc.threshold = 0.25)
+
+
+# test done
+gbm.markers <- FindMarkers(object = seurat.obj, ident.1=c("pre-CC1", "pre-CC2", "CC1", "CC2", "CC3", "CC4", "CC5"), ident.2= c("NSC", "TAC", "NB", "Neuron", "OPC", "COP", "OL"), test.use = "DESeq2", max.cells.per.ident = 50)       
+
+
+precc1.markers <- FindMarkers(object = obj, ident.1="pre-CC1", ident.2= c("OPC", "COP"), test.use = "DESeq2", max.cells.per.ident = 50)                
+
+precc1.add.markers <- FindMarkers(object = obj, ident.1="pre-CC1", ident.2= NULL, test.use = "DESeq2", max.cells.per.ident = 50)          
+
+precc2.markers <- FindMarkers(object = obj, ident.1="pre-CC2", ident.2= c("OPC", "COP"), test.use = "DESeq2", max.cells.per.ident = 50)
+
+precc2.add.markers <- FindMarkers(object = obj, ident.1="pre-CC2", ident.2= NULL, test.use = "DESeq2", max.cells.per.ident = 40)  
+
+cc.markers <- FindMarkers(object = seurat.obj, ident.1=c("CC1", "CC2", "CC3", "CC4", "CC5"), ident.2= c("pre-CC1", "pre-CC2"), test.use = "DESeq2", max.cells.per.ident = 50) 
+
+cc1.markers <- FindMarkers(object = seurat.obj, ident.1="CC1", ident.2= c("pre-CC1", "pre-CC2"), test.use = "DESeq2", max.cells.per.ident = 50) 
+
+cc2.markers <- FindMarkers(object = seurat.obj, ident.1="CC2", ident.2= c("pre-CC1", "pre-CC2"), test.use = "DESeq2", max.cells.per.ident = 50)
+
+cc3.markers <- FindMarkers(object = seurat.obj, ident.1="CC3", ident.2= c("pre-CC1", "pre-CC2"), test.use = "DESeq2", max.cells.per.ident = 50)
+
+cc4.markers <- FindMarkers(object = seurat.obj, ident.1="CC4", ident.2= c("pre-CC1", "pre-CC2"), test.use = "DESeq2", max.cells.per.ident = 40)
+
+cc5.markers <- FindMarkers(object = seurat.obj, ident.1="CC5", ident.2= c("pre-CC1", "pre-CC2"), test.use = "DESeq2", max.cells.per.ident = 50)
+
+
+write.csv(precc1.markers, file = "precc1_deseq2.csv")
+write.csv(precc2.markers, file = "precc2_deseq2.csv")
+write.csv(cc.markers, file = "cc_deseq2.csv")
+                                    
+```
+
+
+
+
+```{r}
+#obj.precc <- subset(obj.final, idents = c("CC1", "CC2", "CC3", "CC4"),  invert = TRUE)
+
+precc1.markers <- FindMarkers(object = obj.precc, ident.1="pre-CC1", ident.2= NULL, test.use = "DESeq2", max.cells.per.ident = 40)                
+precc2.markers <- FindMarkers(object =obj.precc, ident.1="pre-CC2", ident.2= NULL, test.use = "DESeq2", max.cells.per.ident = 50)
+
+cc1.markers <- FindMarkers(object = obj.mut, ident.1="CC1", ident.2= NULL, test.use = "DESeq2", max.cells.per.ident = 50)
+cc2.markers <- FindMarkers(object = obj.mut, ident.1="CC2", ident.2= NULL, test.use = "DESeq2", max.cells.per.ident = 50)
+cc3.markers <- FindMarkers(object = obj.mut, ident.1="CC3", ident.2= NULL, test.use = "DESeq2", max.cells.per.ident = 50)
+cc4.markers <- FindMarkers(object = obj.mut, ident.1="CC4", ident.2= NULL, test.use = "DESeq2", max.cells.per.ident = 50)
+
+
+write.csv(precc1.markers, file = "precc1_deseq2.csv")
+write.csv(precc2.markers, file = "precc2_deseq2.csv")
+write.csv(cc1.markers, file = "cc1_deseq2.csv")
+write.csv(cc2.markers, file = "cc2_deseq2.csv")
+write.csv(cc3.markers, file = "cc3_deseq2.csv")
+write.csv(cc4.markers, file = "cc4_deseq2.csv")
+
+
+```
+
+
+```{r}
+cc1.markers <- FindMarkers(object = obj.mut, ident.1="CC1", ident.2= c("pre-CC1", "pre-CC2"), test.use = "DESeq2", max.cells.per.ident = 50) 
+cc2.markers <- FindMarkers(object = obj.mut, ident.1="CC2", ident.2= c("pre-CC1", "pre-CC2"), test.use = "DESeq2", max.cells.per.ident = 50)
+cc3.markers <- FindMarkers(object = obj.mut, ident.1="CC3", ident.2= c("pre-CC1", "pre-CC2"), test.use = "DESeq2", max.cells.per.ident = 50)
+cc4.markers <- FindMarkers(object = obj.mut, ident.1="CC4", ident.2= c("pre-CC1", "pre-CC2"), test.use = "DESeq2", max.cells.per.ident = 50)
+
+write.csv(cc1.markers, file = "cc1_precc_deseq2.csv")
+write.csv(cc2.markers, file = "cc2_precc_deseq2.csv")
+write.csv(cc3.markers, file = "cc3_precc_deseq2.csv")
+write.csv(cc4.markers, file = "cc4_precc_deseq2.csv")
+
+
+```
+
+
+```{r}
+#obj.precc <- subset(obj.final, idents = c("CC1", "CC2", "CC3", "CC4"),  invert = TRUE)
+
+precc.markers <- FindMarkers(object =obj.precc, ident.1=c("pre-CC1", "pre-CC2"), ident.2= NULL, test.use = "DESeq2", max.cells.per.ident = 30)
+
+cc.markers <- FindMarkers(object = obj.mut, ident.1=c("CC1", "CC2", "CC3", "CC4"), ident.2= NULL, test.use = "DESeq2", max.cells.per.ident = 40)
+write.csv(precc.markers, file = "precc_normal_deseq2.csv")
+write.csv(cc.markers, file = "cc_precc_deseq2.csv")
+
+
+
+precc1.add.markers <- FindMarkers(oobject =obj.precc, ident.1="pre-CC1", ident.2= NULL, test.use = "DESeq2", max.cells.per.ident = 50)          
+
+precc2.markers <- FindMarkers(object =obj.precc, ident.1="pre-CC2", ident.2= NUL, test.use = "DESeq2", max.cells.per.ident = 50)
+
+
+```
+
+
+## Expression of individual genes
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+
+
+# Violin Plot
+
+
+
+# Dot Plot
+
+markers.to.plot = c("Aqp4", "Cldn10", "Thbs4", "Ascl1", "Dlx2", "Sox11", "Dcx", "Meg3", "Syt1", "Cspg4", "Lhfpl3", "Tnr", "Gpr17", "Mbp", "Mog", "Foxj1", "Ccdc153", "Cldn5", "Flt1", "Vtn", "Acta2", "Kcnj8", "Pf4", "Mrc1", "P2ry12", "Tmem119", "Lum", "Slc6a13")
+
+markers.to.plot = c("Slc6a13",  "Lum", "Tmem119", "P2ry12", "Mrc1",  "Pf4", "Kcnj8", "Acta2", "Vtn",  "Flt1", "Cldn5", "Ccdc153", "Foxj1",  "Mog", "Mbp", "Gpr17", "Tnr", "Lhfpl3", "Pdgfra",   "Syt1", "Meg3",  "Dcx", "Sox11", "Dlx2",  "Ascl1", "Thbs4",  "Cldn10", "Aqp4")
+
+
+DotPlot(obj.unknown, features = markers.to.plot, cols = c("lightgrey", "black"), dot.scale = 7) +
+  labs(y= "Cell type", x = "Genes", size = 15) +
+  coord_flip() + theme_bw() +
+  theme(axis.text.x = element_text(angle=40, hjust=1, size = 15), axis.text.y = element_text(size = 14), axis.title.x = element_text(size = 16), axis.title.y = element_text(size = 16), 
+        panel.grid.major.y = element_blank(),
+        panel.grid.major.x = element_blank())
+
+
+DotPlot(obj.unknown, features = markers.to.plot) + RotatedAxis()
+
+```
+
+
+
+
+
+
+# Seurat subset (EGFRvIII expressing cells)
+
+```{r}
+# https://satijalab.org/seurat/v3.2/immune_alignment.html
+#### Identify conserved cell type markers
+markers.to.plot = c("Aqp4", "Cldn10", "Thbs4", "Ascl1", "Dlx2", "Sox11", "Dcx", "Meg3", "Syt1", "Cspg4", "Lhfpl3", "Tnr", "Gpr17", "Mbp", "Mog")
+
+DotPlot(seurat.obj, features = markers.to.plot, cols = c("blue", "red"), dot.scale = 8, split.by = "EGFRvIII") + 
+    RotatedAxis()
+
+
+##### DEG comparison depending on EGFRvIII expression
+## Make subset of cells expressing EGFRvIII
+mut <- subset(obj.final, subset = EGFRvIII > 0)
+
+
+## Get cell names
+cellnames <- rownames(mut@meta.data)
+## Mutate a column in original metadata
+obj.final$mut <- rownames(obj.final@meta.data)
+obj.final@meta.data <- obj.final@meta.data %>% mutate(EGFRvIII = ifelse((obj.final %in% cellnames), "Pos", "Neg"))
+
+Idents(obj) <- obj$celltype
+obj$celltype.mut <- paste(Idents(obj), obj$mut, sep = "_")
+table(obj$celltype.mut)
+
+Idents(obj) <- obj$orig.ident
+obj$stage.mut <- paste(Idents(obj), obj$mut, sep = "_")
+table(obj$stage.mut)
+
+
+Idents(seurat.obj) <- seurat.obj$stage.mut
+obj.final <- subset(seurat.obj, idents = "Control_Pos", invert = TRUE)
+# cannot transfer all metadata to subset
+save(obj.final, file = "seurat_obj_final.RData")
+
+## DE analysis
+# https://satijalab.org/seurat/v3.1/de_vignette.html
+Idents(obj.final) <- obj.final$celltype.mut
+mutopc.markers <- FindMarkers(object = obj.final, ident.1="OPC_Pos", ident.2= "OPC_Neg", test.use = "DESeq2", max.cells.per.ident = 50)   
+
+mutcc1.markers <- FindMarkers(object = seurat.obj, ident.1="CC1_Pos", ident.2= "CC1_Neg", test.use = "DESeq2", max.cells.per.ident = 50)
+
+write.csv(mutopc.markers, file = "mutopc_markers.csv")
+
+#########cluster average
+# https://satijalab.org/seurat/v3.0/interaction_vignette.html
+cluster.averages <- AverageExpression(seurat.obj)
+head(cluster.averages[["RNA"]][, 1:5])
+
+orig.levels <- levels(seurat.obj)
+Idents(seurat.obj) <- gsub(pattern = " ", replacement = "_", x = Idents(seurat.obj))
+orig.levels <- gsub(pattern = " ", replacement = "_", x = orig.levels)
+levels(seurat.obj) <- orig.levels
+cluster.averages <- AverageExpression(seurat.obj, return.seurat = TRUE)
+cluster.averages
+
+save(cluster.averages, file = "clusteraverage.RData")
+# interactive plot to identify gene outliers
+#CellScatter(cluster.averages, cell1 = "NK", cell2 = "CD8_T")
+## How can I calculate expression averages separately for each replicate?
+#cluster.averages <- AverageExpression(pbmc, return.seurat = TRUE, add.ident = "replicate")
+#CellScatter(cluster.averages, cell1 = "CD8_T_rep1", cell2 = "CD8_T_rep2")
+
+DoHeatmap(cluster.averages, features = unlist(TopFeatures(seurat.obj[["pca"]], balanced = TRUE)), size = 3, 
+    draw.lines = FALSE)
+
+DoHeatmap(cluster.averages, features = unlist(TopFeatures(seurat.obj[["pca"]], balanced = TRUE)), size = 3, 
+    draw.lines = FALSE)
+
+markers.to.plot = c("")
+DoHeatmap(subset(obj, downsample = 200), features = markers.to.plot, angle = 90, label = FALSE) 
+
+
+```
+
+
+
+```{r}
+library(dplyr)
+library(Seurat)
+library(patchwork)
+
+
+Idents(seurat.obj) <- obj$EGFRvIII
+
+Idents(seurat.obj) <- seurat.obj$celltype
+
+table(Idents(seurat.obj), seurat.obj$EGFRvIII)
+         
+# https://satijalab.org/seurat/v3.2/immune_alignment.html
+#### Identify conserved cell type markers
+tac.markers <- FindConservedMarkers(seurat.obj, ident.1 = "TAC", grouping.var = "mut", verbose = FALSE)
+cop.markers <- FindConservedMarkers(seurat.obj, ident.1 = "COP", grouping.var = "mut", verbose = FALSE)
+
+
+head(nsc.cells)
+markers.to.plot = c("Aqp4", "Cldn10", "Thbs4", "Ascl1", "Dlx2", "Sox11", "Dcx", "Meg3", "Syt1", "Cspg4", "Lhfpl3", "Tnr", "Gpr17", "Mbp", "Mog")
+
+DotPlot(seurat.obj, features = markers.to.plot, cols = c("blue", "red"), dot.scale = 8, split.by = "EGFRvIII") + 
+    RotatedAxis()
+
+
+#### Identify DEG across conditions
+library(ggplot2)
+library(cowplot)
+DefaultAssay(seurat.obj) <- "RNA"
+
+theme_set(theme_cowplot())
+nsc <- subset(seurat.obj, idents = "NSC")
+
+Idents(nsc.cells) <- "EGFRvIII"
+avg.nsc.cells <- log1p(AverageExpression(nsc.cells, verbose = FALSE)$RNA)
+avg.nsc.cells$gene <- rownames(avg.nsc.cells)
+
+cd14.mono <- subset(immune.combined, idents = "CD14 Mono")
+Idents(cd14.mono) <- "stim"
+avg.cd14.mono <- log1p(AverageExpression(cd14.mono, verbose = FALSE)$RNA)
+avg.cd14.mono$gene <- rownames(avg.cd14.mono)
+
+genes.to.label = c("ISG15", "LY6E", "IFI6", "ISG20", "MX1", "IFIT2", "IFIT1", "CXCL10", "CCL8")
+p1 <- ggplot(avg.t.cells, aes(CTRL, STIM)) + geom_point() + ggtitle("CD4 Naive T Cells")
+p1 <- LabelPoints(plot = p1, points = genes.to.label, repel = TRUE)
+p2 <- ggplot(avg.cd14.mono, aes(CTRL, STIM)) + geom_point() + ggtitle("CD14 Monocytes")
+p2 <- LabelPoints(plot = p2, points = genes.to.label, repel = TRUE)
+plot_grid(p1, p2)
+
+
+```
+
+
+
+```{r}
+library(Seurat)
+library(ggplot2)
+library(dplyr)
+
+table(Idents(obj))
+Idents(obj) <- obj$celltype
+
+
+seurat.obj  <- subset(obj, idents= c("NSC", "TAC", "NB", "Neuron","OPC", "COP", "OL", "pre-CC1", "pre-CC2", "CC1", "CC2", "CC3", "CC4", "CC5"))
+
+subcluster <- subset(obj, idents= c("pre-CC1", "pre-CC2", "CC1", "CC2", "CC3", "CC5"))
+
+
+subcluster <- subset(obj, idents= c("NSC", "OPC", "pre-CC1", "pre-CC2", "CC1", "CC2", "CC3", "CC5"))
+DefaultAssay(subcluster) <- "RNA"
+subcluster <- FindVariableFeatures(subcluster, selection.method = "vst", nfeatures = 2000)
+#DefaultAssay(obj.sub) <- "integrated"
+subcluster <- ScaleData(subcluster, verbose = FALSE, vars.to.regress = c("percent.mt"))
+subcluster <- RunPCA(subcluster, npcs = 20, verbose = FALSE)
+ElboPlot(subcluster)
+
+subcluster <- FindNeighbors(subcluster, dims = 1:10, resolution = 0.5)
+subcluster <- RunUMAP(subcluster, dims = 1:20)
+subcluster <- FindClusters(subcluster)
+
+subcluster$subset_clusters <- Idents(subcluster)
+
+DimPlot(subcluster, reduction = "umap", label = TRUE, label.size = 5) + NoAxes() + NoLegend()
+DimPlot(subcluster, reduction = 'umap', group.by = "celltype") + NoAxes()
+DimPlot(subcluster, reduction = 'umap', group.by = "orig.ident") + NoAxes() 
+DimPlot(subcluster, reduction = 'umap', group.by = "Phase") + NoAxes() 
+
+FeaturePlot(subcluster, features = "nUMI", "percent.mito", "percent.ribo")
+
+DimPlot(subcluster, reduction = 'umap', split.by = "orig.ident") + theme(text = element_text(size = 15)) +NoLegend()
+
+DimPlot(subcluster, label=T, group.by="subset_clusters", cells.highlight=WhichCells(subcluster, idents = "7"), cols.highlight = "darkred", cols= "grey") +NoAxes() + NoLegend()
+
+## Stacked barplot
+ggplot(subcluster@meta.data, aes(x=subset_clusters, fill= orig.ident)) + geom_bar(position = "fill") + theme(text = element_text(size = 15)) + theme(panel.background = element_blank()) + theme(axis.line = element_line(colour = "black")) 
+
+
+FeaturePlot(object= subcluster, reduction = "umap", features="EGFRvIII") + NoLegend() 
+FeaturePlot(object = subcluster, features = c("Cd133", "Cd15", "L1cam"), ncol =3, min.cutoff = "q10", max.cutoff = "q90") + NoLegend() + NoAxes()
+
+FeaturePlot(object = subcluster, features = c("Prom1", "Fut4", "L1cam", "Sox2", "Aldh1a1", "Nes", "Olig2", "Nanog", "Itga6"), ncol =3, min.cutoff = "q10", max.cutoff = "q90") 
+
+ggplot(obj.sub@meta.data, aes(x=celltype, fill=orig.ident)) + geom_bar(position = "fill") + theme(text = element_text(size = 15)) + theme(panel.background = element_blank()) + theme(axis.line = element_line(colour = "black"))
+
+subcluster.markers <- FindAllMarkers(object = subcluster, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+top5 <- subcluster.markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_logFC)
+top5
+write.csv(subcluster.markers, file = "subcluster.markers_clustermarkers.csv")
+write.csv(top5, file = "subset_top5.csv")
+
+#heatmap
+DoHeatmap(subcluster, features = unique(top5$gene), angle = 90, label = FALSE) +  NoLegend()
+DoHeatmap(subcluster, features = unique(top5$gene), label = TRUE)  +  NoLegend()
+
+csc.nb.markers <- FindMarkers(subcluster, ident.1 = "4", ident.2 = NULL,test.use = "negbinom")
+write.csv(csc.nb.markers, file = "csc_nb_markers.csv")
+
+precc1_vs_opc <- head(FindMarkers(seurat.obj, ident.1 = "pre-CC1", ident.2 = c("OPC", "COP", "OL"), test.use = "MAST"))
+precc1_vs_all <- head(FindMarkers(seurat.obj, ident.1 = "pre-CC1", ident.2 = NULL, test.use = "MAST"))
+precc2_vs_opc <-head(FindMarkers(seurat.obj, ident.1 = "pre-CC2", ident.2 = NULL, test.use = "MAST"))
+precc2_vs_all <-head(FindMarkers(seurat.obj, ident.1 = "pre-CC2", ident.2 = NULL, test.use = "MAST"))
+
+cc_vs_precc <- head(FindMarkers(seurat.obj, ident.1 = c("CC1", "CC2", "CC3", "CC4", "CC5"), ident.2 = c("pre-CC1", "pre-CC2"), test.use = "MAST"))
+
+save(subcluster, file = "subcluster.RData")
+
+
+```
+
+
+
+
+###### Other Miscellaneous jobs
+
+### Combine datasets
+
+```{r cars}
+
+control <- merge(ctrl4w, y = c(ctrl10w1, ctrl10w2), add.cell.ids = c("R1","R2", "R3"), project = "Control")
+early <- merge(svz4w1, y = c(svz4w2, svz4w3), add.cell.ids = c("R1","R2", "R3"), project = "Mut-4W")
+intermediate <- merge(svz10w1, y = c(svz10w2, svz10w3, svz10w4, svz10w5), add.cell.ids = c("R1","R2", "R3", "R4", "R5"), project = "Mut-10W")
+late <- merge(svz18w1, y = c(svz18w2, svz18w3), add.cell.ids = c("R1","R2", "R3"), project = "Mut-18W")
+tumor <- merge(tu1, y = c(tu2, tu3), add.cell.ids = c("R1","R2", "R3"), project = "Mut-Tu")
+
+# If project name is not correct, change by following codes
+
+Idents(control) <- control$orig.ident
+control <- RenameIdents(control, 'R1' = "Control_R1", 'R2' = "Control_R2", 'R3' = "Control_R3")
+control$batch <- Idents(control)
+
+Idents(late) <- late$orig.ident
+late <- RenameIdents(late, 'R1' = "MUT18W_R1", 'R2' = "MUT18W_R2", 'R3' = "MUT18W_R3")
+late$batch <- Idents(late)
+table(late$batch)
+
+
+save(control, file = "control_combined.RData")
+save(early, file = "early_combined.RData")
+save(intermediate, file ="intermediate_combined.RData")
+save(late, file = "late_combined.RData")
+save(tumor, file= "tumor_combined.RData")
+```

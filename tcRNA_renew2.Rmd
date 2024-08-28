@@ -1,0 +1,457 @@
+---
+title: "tcRNA"
+author: "DohyeonCha"
+date: '2021 1 9 '
+output: html_document
+---
+### Monocle3 trajectory inference
+```{r}
+require(devtools); require(reticulate)
+source("http://bioconductor.org/biocLite.R")
+biocLite()
+biocLite("monocle")
+devtools::install_github("cole-trapnell-lab/DDRTree", ref="simple-ppt-like")
+devtools::install_github("cole-trapnell-lab/L1-graph")
+py_install('umap-learn', pip = T, pip_ignore_installed = T) 
+py_install("louvain")
+```
+
+### EnhancedVolcanoPlot with MAST results
+```{r}
+require(EnhancedVolcano)
+
+mastRes_oligCells_400 %>% EnhancedVolcano(., lab=rownames(.), x="timeOrder.logFC", y="timeOrder.H_fdr", xlim=c(-0.5,0.5), pCutoff = 10e-6, FCcutoff = 0.1, ,ylim=c(0, 30),labSize = 3.5)
+
+mastRes_NSC_oligCells %>% EnhancedVolcano(., lab=rownames(.), x="timeOrder.logFC", y="timeOrder.H_fdr", xlim=c(-0.5,0.5), pCutoff = 10e-6, FCcutoff = 0.1, ,labSize = 3.5)
+
+mastRes_immuneCells %>% EnhancedVolcano(., lab=rownames(.), x="timeOrder.logFC", y="timeOrder.H_fdr", xlim=c(-0.5,0.5), pCutoff = 10e-6, FCcutoff = 0.1, labSize = 3.5)
+mastRes_immuneCells_400 %>% EnhancedVolcano(., lab=rownames(.), x="timeOrder.logFC", y="timeOrder.H_fdr", xlim=c(-0.5,0.5), pCutoff = 10e-2, FCcutoff = 0.1, labSize = 3.5)
+```
+
+
+## Viz
+```{r}
+gbmCells=c("CC1","CC2","CC3","CC4","pre-CC1","pre-CC2")
+pre_gbmCells=c("pre-CC1","pre-CC2")
+oligCells=c("OPC","COP",gbmCells)
+olig_precc=c("OPC", "COP", pre_gbmCells)
+
+NSC_oligCells=c("NSC",oligCells)
+neuralCells=c("OL", "Neuron", "TAC", "NSC", "NB", oligCells)
+immuneCells=c("MG", "TAM1", "TAM2", "MAC")
+otherCells=c("EC", "VSMC", "PC", "Meninges","EPC")
+precursorCells=c("NSC", "NB", "OPC", "COP", "TAC")
+totalCells=c(neuralCells, immuneCells, otherCells)
+
+#nsc.olig = obj.final %>% subset(., subset=celltype%in%NSC_oligCells & orig.ident!="Control")
+#olig = obj.final %>% subset(., subset=celltype%in%oligCells & orig.ident!="Control")
+#immune = obj.final %>% subset(., subset=celltype%in%immuneCells & orig.ident!="Control")
+
+#precc1=obj.final %>% subset(., subset=celltype=="pre-CC1" & orig.ident!="Control")
+#precc2=obj.final %>% subset(., subset=celltype=="pre-CC2" & orig.ident!="Control")
+
+obj.final2=obj.final
+#obj.final2$inOligCell=((obj.final2$celltype %in% oligCells) %>% as.numeric())
+
+#obj.final2$inOligPrecc=((obj.final2$celltype %in% olig_precc) %>% as.numeric())
+
+oligPrecc=obj.final2 %>% subset(., subset=celltype%in%olig_precc & orig.ident!="Control")
+oligGBM=obj.final2 %>% subset(., subset=celltype%in%oligCells & orig.ident!="Control")
+
+#obj.immune=obj.final2 %>% subset(., subset=celltype%in%immuneCells & orig.ident!="Control")
+
+
+geneN="Cx3cr1"
+#oligPrecc %>% VlnPlot(., geneN, group.by = "orig.ident")
+#oligPrecc %>% FeaturePlot(., geneN, split.by = "orig.ident", ncol=1)
+
+#oligGBM %>% VlnPlot(., geneN, group.by = "orig.ident")
+#oligGBM %>% FeaturePlot(., geneN, split.by = "orig.ident", ncol=1)
+
+#test12345 %>% VlnPlot(., geneN, group.by = "orig.ident")
+#test12345 %>% FeaturePlot(., geneN, split.by = "orig.ident", ncol=1)
+#precc2 %>%  VlnPlot(., geneN, group.by = "orig.ident")
+#precc2 %>% FeaturePlot(., geneN, split.by = "orig.ident")
+```
+
+
+## Parse counts + metadata
+```{r}
+require(ggplot2); require(dplyr); require(Seurat); require(data.table)
+load("/home/dcha/glioblastoma/rdata/obj_final.RData")
+
+objMeta=obj.final@meta.data %>% select(c("celltype"))
+objMeta$timePoint=obj.final@meta.data$batch %>% gsub(' ', '', .) %>% strsplit("_") %>% lapply(., function(x) x[[1]]) %>% as.character()
+objMeta$rep=obj.final@meta.data$batch %>% gsub(' ', '', .) %>% strsplit("_") %>% lapply(., function(x) x[[2]]) %>% as.character()
+
+#rawCountsObjFinal = obj.final@assays$RNA@counts %>% as.matrix() %>% t(.) %>% as.data.frame()
+
+#rawLogNormObjFinal = obj.final@assays$RNA@data %>% as.matrix() %>% t(.) %>% as.data.frame()
+
+#rawCountsObjFinalDF = bind_cols(objMeta,rawCountsObjFinal)
+
+#rawLogNormObjFinalDF = bind_cols(objMeta,rawLogNormObjFinal)
+
+cpmObjFinal <- NormalizeData(obj.final, normalization.method = "RC", scale.factor = 1e6)
+cpmObjFinal.mtx=cpmObjFinal@assays$RNA@data %>% as.matrix() %>% t(.) %>% as.data.frame()
+objFinal.mtx=obj.final@assays$RNA@counts %>% as.matrix() %>% t(.) %>% as.data.frame()
+logNormObjFinal.mtx=obj.final@assays$RNA@data %>% as.matrix() %>% t(.) %>% as.data.frame()
+
+varGenes=obj.final@assays$RNA@var.features
+
+var.cpmObjFinal.df = bind_cols(objMeta, cpmObjFinal.mtx[,varGenes])
+var.objFinal.df = bind_cols(objMeta, objFinal.mtx[,varGenes])
+var.logNormObjFinal.df = bind_cols(objMeta, logNormObjFinal.mtx[,varGenes])
+
+
+var.cpmObjFinal.df %>% data.table::fwrite(., "/home/dcha/glioblastoma/var.musGBM_CPM.txt", sep="\t", quote=F, row.names = TRUE, col.names = TRUE)
+var.objFinal.df %>% data.table::fwrite(., "/home/dcha/glioblastoma/var.musGBM_counts.txt", sep="\t", quote=F, row.names = TRUE, col.names = TRUE)
+var.logNormObjFinal.df %>% data.table::fwrite(., "/home/dcha/glioblastoma/var.musGBM_logNorm.txt", sep="\t", quote=F, row.names = TRUE, col.names = TRUE)
+
+#rawCPMObjFinal = cpmObjFinal@assays$RNA@counts %>% as.matrix() %>% t(.) %>% as.data.frame()
+#rawCPMObjFinalDF = bind_cols(objMeta,rawCPMObjFinal)
+#write.table(rawCPMObjFinalDF, "/home/dcha/glioblastoma/musGBM_CPM.txt", sep="\t",quote=F)
+```
+
+###
+```{r}
+dup.final = obj.final
+rplRatio = PercentageFeatureSet(dup.final, pattern = "^Rpl")
+rpsRatio = PercentageFeatureSet(dup.final, pattern = "^Rps")
+riboRatio=rpsRatio + rplRatio
+
+dup.final$percent.ribo <- riboRatio
+
+dupTest=dup.final %>% subset(., subset=celltype%in%oligCells) %>% subset(., subset=orig.ident!="Control")
+dupTestSCA=runMAST_DGE_timeOrder(dup.final, cellTypes=oligCells)
+
+```
+
+### scRNAseq time-coefficient using MAST
+```{r}
+require(MAST); require(Seurat); require(dplyr)
+#obj.down = obj.final %>% subset(., cells = sample(Cells(.), 2000))
+#obj.down$timeOrder=obj.down$orig.ident %>% as.numeric()
+
+#load("/home/dcha/glioblastoma/rdata/obj_final.RData")
+gbmCells=c("CC1","CC2","CC3","CC4","pre-CC1","pre-CC2")
+oligCells=c("OPC","COP",gbmCells)
+NSC_oligCells=c("NSC",oligCells)
+neuralCells=c("OL", "Neuron", "TAC", "NSC", "NB", oligCells)
+immuneCells=c("MG", "TAM1", "TAM2", "MAC")
+otherCells=c("EC", "VSMC", "PC", "Meninges","EPC")
+precursorCells=c("NSC", "NB", "OPC", "COP", "TAC")
+totalCells=c(neuralCells, immuneCells, otherCells)
+
+runMAST_DGE_timeOrder=function(obj, cellTypes=totalCells, controlInclude=FALSE, downsampling=NULL){
+  require(MAST); require(Seurat); require(dplyr)
+  obj = obj %>% subset(., subset=celltype%in%cellTypes)
+  obj@meta.data$celltype = obj@meta.data$celltype %>% droplevels(.)
+  
+  obj$orig.ident=factor(obj$orig.ident)
+  levels(obj$orig.ident)=c("Control", "Early Phase", "Intermediate Phase", "Late Phase", "Tumor")
+  
+  if(!controlInclude){
+    obj = obj %>% subset(., subset=orig.ident!="Control")
+    obj$orig.ident = obj$orig.ident %>% droplevels(.)
+  }
+  obj$timeOrder = obj$orig.ident %>% as.numeric()
+  
+  if (!is.null(downsampling)){
+    obj = obj %>% subset(., downsample=downsampling)
+  }
+  
+  print(obj$celltype %>% table(.))
+  print(obj$orig.ident %>% table(.))
+  print(obj$timeOrder %>% table(.))
+
+  obj.sca=obj %>% as.SingleCellExperiment %>% SceToSingleCellAssay(.)
+  colData(obj.sca)$cngeneson = scale(colSums(assay(obj.sca)>0))
+  
+  zlmCond = zlm(formula = as.formula("~timeOrder+cngeneson+percent.ribo+celltype+(1|batch)+"), sca=obj.sca, method="glmer", ebayes=FALSE)
+  zlmCond = zlm(formula = as.formula("~timeOrder+cngeneson+percent.ribo+celltype"), sca=obj.sca)
+
+  summaryCond = summary(zlmCond, doLRT="timeOrder")
+  summaryDt = summaryCond$datatable
+  dt1 = summaryDt[contrast=="timeOrder" & component=="H", .(primerid, `Pr(>Chisq)`)]
+  dt2 = summaryDt[contrast=="timeOrder" & component=="logFC", .(primerid, coef, z)]
+  de_res = merge(dt1, dt2, by="primerid")
+  colnames(de_res) = c("gene", "timeOrder.H_p", "timeOrder.logFC", 'timeOrder.logFC_z')
+  de_res$timeOrder.H_fdr = p.adjust(de_res$timeOrder.H_p, "fdr")
+  de_res=de_res %>% na.omit(.)
+  return(de_res)
+}
+
+#mastRes_totalCells_400=runMAST_DGE_timeOrder(obj.final, cellTypes=totalCells, downsampling = 400)
+#write.table(mastRes_totalCells_400, "/home/dcha/glioblastoma/mast/results/mastRes_totalCells_400.txt", row.names = F, quote=F)
+
+#mastRes_neuralCells_400=runMAST_DGE_timeOrder(obj.final, cellTypes=neuralCells, downsampling = 400)
+#mastRes_NSC_oligCells_400=runMAST_DGE_timeOrder(obj.final, cellTypes=NSC_oligCells, downsampling = 400)
+mastRes_oligCells_400=runMAST_DGE_timeOrder(obj.final, cellTypes=oligCells, downsampling = 400)
+#mastRes_precursorCells_400=runMAST_DGE_timeOrder(obj.final, cellTypes=precursorCells, downsampling = 400)
+#mastRes_immuneCells_400=runMAST_DGE_timeOrder(obj.final, cellTypes=immuneCells, downsampling = 400)#
+
+#mastRes_totalCells=runMAST_DGE_timeOrder(obj.final, cellTypes=totalCells, downsampling = NULL)
+#mastRes_neuralCells=runMAST_DGE_timeOrder(obj.final, cellTypes=neuralCells, downsampling = NULL)
+#mastRes_NSC_oligCells=runMAST_DGE_timeOrder(obj.final, cellTypes=NSC_oligCells, downsampling = NULL)
+#mastRes_oligCells=runMAST_DGE_timeOrder(obj.final, cellTypes=oligCells, downsampling = NULL)
+#mastRes_precursorCells=runMAST_DGE_timeOrder(obj.final, cellTypes=precursorCells, downsampling = NULL)
+#mastRes_immuneCells=runMAST_DGE_timeOrder(obj.final, cellTypes=immuneCells, downsampling = NULL)
+```
+
+### MAST results
+```{r}
+order.table.write=function(fn){
+  require(data.table)
+  setwd("/home/dcha/glioblastoma/mast/results")
+  orderedPath="/home/dcha/glioblastoma/mast/ordered_results/"
+
+  read.table(fn, header=T, row.names=1) %>% arrange(timeOrder.H_fdr) %>% fwrite(.,file=paste0(orderedPath, fn), sep="\t", row.names=T)
+}
+
+genes2filter=function(df){
+  require(dplyr)
+  genes=rownames(df)
+  filtered.genes = genes %>% .[!grepl('^Rpl',.)] %>% .[!grepl('^Rps',.)] %>% .[!grepl('^mt-',.)] %>% .[!grepl("^A[A-Z][0-9]",.)] %>% .[!grepl("^Gm[0-9]",.)] %>% .[!grepl("Rik$",.)] %>% .[!grepl("^H[0-9]-",.)]
+
+  return(df[filtered.genes,])
+}
+
+order.table.write("mastRes_immuneCells_400.txt")
+order.table.write("mastRes_oligCells_400.txt")
+order.table.write("mastRes_NSC_oligCells_400.txt")
+order.table.write("mastRes_totalCells_400.txt")
+order.table.write("mastRes_neuralCells_400.txt")
+order.table.write("mastRes_precursorCells_400.txt")
+order.table.write("mastRes_immuneCells.txt")
+order.table.write("mastRes_precursorCells.txt")
+order.table.write("mastRes_oligCells.txt")
+order.table.write("mastRes_NSC_oligCells.txt")
+
+setwd("/home/dcha/glioblastoma/mast/ordered_results")
+
+mastRes_immuneCells_400 = read.table("mastRes_immuneCells_400.txt", header=T, row.names=1) %>% genes2filter(.)
+
+mastRes_oligCells_400 = read.table("mastRes_oligCells_400.txt", header=T, row.names=1) %>% genes2filter(.)
+
+mastRes_NSC_oligCells_400 = read.table("mastRes_NSC_oligCells_400.txt", header=T, row.names=1)%>% genes2filter(.)
+ 
+mastRes_totalCells_400 = read.table("mastRes_totalCells_400.txt", header=T, row.names=1) %>% genes2filter(.)
+
+mastRes_neuralCells_400 = read.table("mastRes_neuralCells_400.txt", header=T, row.names=1)  %>% genes2filter(.)
+
+mastRes_precursorCells_400 = read.table("mastRes_precursorCells_400.txt", header=T, row.names=1)%>% genes2filter(.)
+
+mastRes_immuneCells = read.table("mastRes_immuneCells.txt", header=T, row.names=1) %>% genes2filter(.)
+
+mastRes_precursorCells = read.table("mastRes_precursorCells.txt", header=T, row.names=1) %>% genes2filter(.)
+
+mastRes_oligCells = read.table("mastRes_oligCells.txt", header=T, row.names=1) %>% genes2filter(.)
+
+mastRes_NSC_oligCells = read.table("mastRes_NSC_oligCells.txt", header=T, row.names=1) %>% genes2filter(.)
+```
+
+### ImpulseDE2 for oligodendrocytic cells
+
+```{r}
+require(ImpulseDE2); require(DESeq2)
+require(ggplot2); require(dplyr)
+
+setwd("/home/dcha/glioblastoma/tcRNA_renew")
+
+precc_resultListImpulseDE2 = list()
+
+categories=c("precc1_timeCellRep")
+
+for (typesOfCell in categories){
+  avgCounts = read.table(paste0(typesOfCell,"_filter20_Avg.txt"), header=T, sep="\t",
+  row.names=1) %>% as.data.frame() %>% as.matrix() %>% t(.) %>% round(.,0)
+  avgCounts = avgCounts+1
+  
+  avgMeta = read.table(paste0(typesOfCell,"_filter20_Meta.txt"), sep="\t",
+  header=T, row.names = 1) %>% as.data.frame()
+  
+  gbmImpulse=runImpulseDE2(
+  matCountData = avgCounts,
+  dfAnnotation = avgMeta,
+  boolCaseCtrl = FALSE,
+  vecConfounders = NULL,
+  boolIdentifyTransients = TRUE,
+  scaNProc=30,
+  )
+  
+  gbmImpulse$dfImpulseDE2Results %>% arrange(p) %>%
+  write.table(., paste0(typesOfCell,"_impulseDE2.result.txt"), 
+  quote=F, row.names=F, sep="\t")
+  precc_resultListImpulseDE2=c(precc_resultListImpulseDE2, gbmImpulse)
+}
+
+names(precc_resultListImpulseDE2) = categories
+```
+
+### Prep for Kmeans+TimeSeries Vis
+```{r}
+require(ggplot2); require(dplyr)
+require(tibble)
+
+set.seed(1234)
+clusterNum=7
+olig_cluster_genes=list()
+
+oligImpulse = resultListImpulseDE2$olig_no_control_timeCell
+
+avg_olig = read.table(paste0("olig_no_control_timeCell_filter10_ALL_forKmeans.txt"), sep="\t", header=T, row.names = 1)
+
+topFDRgenes = oligImpulse$dfImpulseDE2Results %>% filter(padj<=0.05) %>% rownames(.)
+
+ctComb=avg_olig[topFDRgenes,]
+matComb = ctComb %>% t(.)
+elbow = scale(matComb) %>% t(.) %>% fviz_nbclust(., kmeans, method="wss") +
+  geom_vline(xintercept = clusterNum, linetype = 2) +
+  labs(subtitle = "Elbow method")
+print(elbow)
+  
+ctComb$kmCluster=kmeans(scale(matComb) %>% t(.), clusterNum)$cluster
+
+ctComb$kmCluster=kmeans(scale(matComb) %>% t(.), clusterNum)$cluster
+
+oligHm = Heatmap(scale(matComb) %>% t(.), name = "Relative\nUMI counts",
+    row_names_gp = gpar(fontsize = 7),
+    show_row_names = T, show_column_names = T,
+    column_names_side = "bottom",
+    row_split = ctComb$kmCluster,
+    cluster_columns=F,cluster_rows=T,)
+print(oligHm)
+
+for (i in 1:clusterNum){
+  olig_cluster_genes[[i]]=rownames(ctComb[row_order(oligHm)[[i]],])
+}
+
+```
+
+### Fast gene_name sorter
+```{r}
+sumup = function(char){
+  exclude = char %>% .[!grepl('^Rp',.)] %>% .[!grepl('^mt',.)] %>% .[!grepl('^H1',.)] %>% .[!grepl('^H2',.)] %>% .[!grepl('^H3',.)] %>% .[!grepl('^H4',.)] %>% knitr::combine_words(and="")
+  
+  riboNum=char %>% grepl('^Rp',.) %>% as.numeric() %>% sum(.)
+  mitoNum=char %>% grepl('^mt',.) %>% as.numeric() %>% sum(.)
+  
+  histNum=0
+  for (h in c("H1", "H2", "H3", "H4")){
+    histNum = histNum + char %>% grepl(paste0('^',h),.) %>% as.numeric() %>% sum(.)
+  }
+  
+  ret=list(exclude, riboNum, mitoNum, histNum)
+  names(ret) = c("Final", "riboNum", "mitoNum", "histNum")
+  return(ret)
+}
+```
+
+
+
+### Misc
+```{r}
+outData2=outData
+rownames(outData2)=outData2$region
+outData2 = outData2[rownames(combSorted),]
+rownames(outData2)=1:dim(outData2)[[1]]
+
+dupCluster=c()
+for (i in outData2$cluster){
+  dupCluster = c(dupCluster, rep(i,14))
+}
+```
+
+
+
+### Time Series plot for each cluster
+```{r}
+require(ImpulseDE2); require(DESeq2)
+require(ggplot2); require(dplyr); require(tibble)
+
+
+#timeSeriesSorted$cluster = dupCluster
+
+gg_color_hue <- function(n) {
+  hues = seq(15, 375, length = n + 1)
+  hcl(h = hues, l = 65, c = 100)[1:n]
+}
+```
+
+### Time series box plot1
+```{r}
+
+timeSeriesPlot = function(df, name, hue, a){
+  df %>% ggplot(., aes(x=timePoint, y=count)) + geom_line(aes(x=timePoint, y=count, group=regionRep), alpha=a, col=hue) + geom_violin(col=hue) + geom_boxplot(width=0.1, outlier.size=0.7, col=hue) +  ggtitle(paste0("Cluster ",name," time course ATAC counts")) + theme_bw() + theme(legend.position = "none")
+}
+
+timeSeriesSorted %>% filter(cluster==1) %>% timeSeriesPlot(., 1, "#F8766D", 0.015)
+timeSeriesSorted %>% filter(cluster==2) %>% timeSeriesPlot(., 2, "#A3A500" ,0.015)
+timeSeriesSorted %>% filter(cluster==3) %>% timeSeriesPlot(., 3, "#00BF7D",0.015)
+timeSeriesSorted %>% filter(cluster==4) %>% timeSeriesPlot(., 4, "#00B0F6",0.015)
+timeSeriesSorted %>% filter(cluster==5) %>% timeSeriesPlot(., 5, "#E76BF3",0.015)
+```
+
+### Time series merged plot
+```{r}
+
+mergedTimeSeries=data.frame()
+for (i in 1:clusterNum){
+  perCluster = timeSeriesSorted %>% filter(cluster==i) %>% group_by (timePoint) %>% summarize(MedianCount=median(count)) %>% mutate(cluster=i)
+  mergedTimeSeries=bind_rows(mergedTimeSeries, perCluster)
+}
+
+mergedTimeSeries$cluster = mergedTimeSeries$cluster %>% as.character() %>% factor(.)
+
+mergedTimeSeries %>% ggplot(., aes(x=timePoint, y=MedianCount, group=cluster, colour=cluster)) + geom_line() + theme_bw()
+
+timeSeriesSorted %>% ggplot(., aes(x=timePoint, y=count,  colour=cluster)) + geom_boxplot(outlier.shape = NA, coef=0.5, position = position_dodge(width = 0.25), alpha=0.3) + ggtitle(paste0("Time course ATAC counts")) + theme_bw() + coord_cartesian(ylim=c(0,1500)) + stat_summary(fun.y = median, geom = 'line', aes(group = cluster , colour = cluster),position = position_dodge(width = 0.25) )
+
+```
+
+
+
+
+### NMF
+```{r}
+require(NMF); require(MutationalPatterns); require(pheatmap); require(scatterplot3d)
+tcomb = combSorted %>% as.matrix() %>% t(.)
+rankN=3
+hclustN=4
+
+nmfATAC=extract_signatures(tcomb, rankN, nrun=20)
+colnames(nmfATAC$signatures) = paste0("NMFsig",1:rankN)
+rownames(nmfATAC$contribution) = paste0("NMFsig",1:rankN)
+
+
+nmfDist=dist(t(scale(nmfATAC$contribution)), method = "euclidean")
+nmfHc=hclust(nmfDist)
+
+#combDf = combSorted
+nmfHcAnnotTemp = nmfHc %>% cutree(., k=hclustN) 
+nmfHcAnnot = nmfHcAnnotTemp %>% as.data.frame() %>% setNames("hClust")
+
+pheatmap(scale(nmfATAC$contribution), show_colnames = FALSE,cluster_rows = F, cluster_cols = T, annotation_col = nmfHcAnnot)
+
+s3d = scatterplot3d(t(nmfATAC$contribution), pch=16, color=nmfHcAnnotTemp)
+legend("bottom", legend=levels(nmfHcAnnotTemp %>% factor(.)), col=1:hclustN, pch=16)
+s3d
+
+timeSeriesSorted2 = timeSeriesSorted
+
+dupCluster2=c()
+for (i in nmfHcAnnot$hClust){
+  dupCluster2 = c(dupCluster2, rep(i,14))
+}
+
+
+timeSeriesSorted2$cluster = dupCluster2
+
+timeSeriesSorted2 %>% filter(cluster==1) %>% timeSeriesPlot(., 1, "#F8766D", 0.05)
+timeSeriesSorted2 %>% filter(cluster==2) %>% timeSeriesPlot(., 2, "#A3A500" ,0.05)
+timeSeriesSorted2 %>% filter(cluster==3) %>% timeSeriesPlot(., 3, "#00BF7D",0.05)
+timeSeriesSorted2 %>% filter(cluster==4) %>% timeSeriesPlot(., 4, "#00B0F6",0.1)
+#timeSeriesSorted2 %>% filter(cluster==5) %>% timeSeriesPlot(., 5, "#E76BF3",0.015)
+```
+

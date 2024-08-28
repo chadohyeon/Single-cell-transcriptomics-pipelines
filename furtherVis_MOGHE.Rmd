@@ -1,0 +1,109 @@
+---
+title: "FurtherVisualMoghe"
+author: "DohyeonCha"
+date: '2021 6 11 '
+output: html_document
+---
+
+```{r}
+require(dplyr); require(ggplot2); require(Seurat); require(MASS)
+umapMogheCCA=moghe.project.sct.cca@reductions$umap@cell.embeddings %>% as.data.frame(.)
+umapMogheCCA$status=moghe.project.sct.cca$status
+
+num_bin=500
+density_Moghe=kde2d(umapMogheCCA %>% filter(status=="Moghe") %>% .$UMAP_1, umapMogheCCA %>% filter(status=="Moghe") %>% .$UMAP_2,n=num_bin)
+
+density_Control=kde2d(umapMogheCCA %>% filter(status=="Control") %>% .$UMAP_1, umapMogheCCA %>% filter(status=="Control") %>% .$UMAP_2,n=num_bin)
+density_Control2=density_Control
+density_Control2$x=density_Moghe$x
+density_Control2$y=density_Moghe$y
+
+diff_density=density_Control2
+diff_density$z = log2(density_Moghe$z+1)-log2(density_Control2$z+1)
+
+diff_density_DF=data.frame(X=rep(NA,num_bin^2))
+
+diff_density_DF$X=rep(diff_density$x,num_bin)
+diff_density_DF$Y=rep(diff_density$y,each=num_bin)
+diff_density_DF$Z=diff_density$z %>% as.vector(.)
+diff_density_DF %>% ggplot(., aes(x=X, y=Y, fill=Z) ) + geom_point() + scale_fill_gradient2(high="red", low="blue")+theme_classic()+xlab("UMAP_1")+ylab("UMAP_2")
+# + scale_colour_gradient(low="#5cbef2", high="#ed2724", na.value="white") 
+
+
+
+```
+
+
+### Dot Plot with PC-euclidean-Pseudobulk Plot
+```{r} 
+#pcEmbs=moghe.project.sct.cca@reductions$pca@cell.embeddings %>% as.data.frame()
+#pcEmbs$cellType=moghe.project.sct.cca$cellType
+
+#varGeneCounts=moghe.project.sct.cca@assays$RNA@counts[moghe.project.sct.cca@assays$integrated@var.features,] %>% as.matrix() %>% t(.) %>% as.data.frame()
+#varGeneCounts$cellType=moghe.project.sct.cca$cellType
+
+pseudoBulkPCemb=pcEmbs %>% group_by(cellType) %>%   summarise_if(is.numeric, mean, na.rm = TRUE) %>% as.data.frame() %>% tibble::column_to_rownames("cellType")
+pseudoBulkCounts=varGeneCounts %>% group_by(cellType) %>%   summarise_if(is.numeric, mean, na.rm = TRUE) %>% as.data.frame() %>% tibble::column_to_rownames("cellType")
+
+pseudoBulkPCemb[1:12,] %>% amap::Dist(., method="euclidean") %>% hclust(.) %>% plot(., hang=-1)
+pseudoBulkCounts[1:12,]  %>% amap::Dist(., method="correlation") %>% hclust(., method = "ward.D2") %>% plot(., hang=-1)
+
+canMarkers=c("MRC1", "CX3CR1", "P2RY12", "SOX9", "GJA1", "GFAP", "PDGFRA", "OLIG1", "OLIG2", "MOBP", "MBP", "MOG", "ST18", "PLP1", "STMN2", "RBFOX3", "SYT1", "GAD1", "GAD2")
+
+cellTypeHClustOrder=c("AC1", "AC2", "MG", "OPC", "OL", "ExN3", "ExN1", "ExN2", "InN4", "InN3", "InN1", "InN2")
+Idents(moghe.project.sct.cca)=Idents(moghe.project.sct.cca) %>% factor(., levels=cellTypeHClustOrder)
+
+DotPlot(moghe.project.sct.cca, features=canMarkers)+coord_flip()+RotatedAxis()
+```
+
+
+## (OLD) Hierarchical clustering of each cell type only, using pseudobulk-averaged CPM or LogNormalized expression level
+```{r}
+require(ggplot2); require(dplyr)
+require(ComplexHeatmap)
+require(colorspace)
+require(RColorBrewer)
+require(colorRamps)
+require(amap)
+
+cellTypes=moghe.ucsf.harmony@meta.data$cellType %>% levels(.)
+
+cellTypesToFilterOut=c()
+
+
+setwd("/home/ryuny43/Moghe")
+cellCount=read.table("var.moghe.ucsf_CPM_cell_filter10_Avg.txt", header=T, sep="\t", row.names=1) ### logNorm or CPM
+
+cellCount$cellType=cellCount %>% rownames(.) %>% factor(., levels=cellTypes)
+
+cellCountFiltered = cellCount %>% dplyr::filter(!(cellType %in% cellTypesToFilterOut))
+
+cellCountFiltered$cellType = cellCountFiltered$cellType %>% droplevels(.)
+
+
+matCell=cellCountFiltered %>% dplyr::select(-c(cellType)) %>% as.matrix()
+
+pccCell=cor(matCell %>% t(.), method="pearson")
+pccCellHClust = hclust(Dist(matCell, method="pearson"), method="average")  ### hclust: "complete", "single", "average", "ward.D", linkage
+pccCellOrder = pccCellHClust$order
+pccCell = pccCell[pccCellOrder, pccCellOrder]
+cellCountFiltered = cellCountFiltered[pccCellOrder,]
+
+
+col_cellType=diverge_hsv(statusCellCountFiltered$cellType %>% levels(.) %>% length(.))
+ctNum=statusCellCountFiltered$cellType %>% levels(.) %>% length(.)
+col_cellType = colorRamps::matlab.like2(ctNum)
+names(col_cellType) = statusCellCountFiltered$cellType %>% levels(.)
+
+col_ct=list("CellType"=col_cellType)
+
+annotCell=HeatmapAnnotation(
+  CellType = cellCountFiltered$cellType,
+  col = col_ct,
+  annotation_name_side ="left"
+)
+
+Heatmap(pccCell, name = "Pearson R", row_names_side = "left", 
+        top_annotation = annotCell, show_row_names = F, show_column_names = F, cluster_columns=F,cluster_rows=F)
+plot(pccCellHClust, hang=-1)
+```

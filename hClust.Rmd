@@ -1,0 +1,102 @@
+---
+title: "hClust"
+author: "DohyeonCha"
+date: '2021 2 16 '
+output: html_document
+---
+## Variable genes
+```{r}
+require(ggplot2); require(dplyr)
+require(Seurat)
+
+setwd("/home/dcha/glioblastoma")
+#nmcBig=read.csv("nmc.csv", header=T, row.names = 1)
+
+#nmcMeta=nmcBig[,1:8]
+#nmcCount=nmcBig[,9:ncol(nmcBig)]
+vgenes=read.table("vst_genes.txt")[,]
+
+vstBig=bind_cols(nmcMeta, nmcCount[,vgenes])
+write.csv(vstBig, "vst.csv")
+```
+
+
+## Hierarchical clustering of each cell type, using pseudobulk-averaged CPM or LogNormalized expression level
+```{r}
+require(ggplot2); require(dplyr)
+require(ComplexHeatmap)
+require(colorspace)
+require(RColorBrewer)
+require(colorRamps)
+require(amap)
+
+
+gbmCells=c("CC1","CC2","CC3","CC4","preCC1","preCC2")
+oligCells=c("OPC","COP",gbmCells)
+NSC_oligCells=c("NSC",oligCells)
+neuralCells=c("OL", "Neuron", "TAC", "NSC", "NB", oligCells)
+immuneCells=c("MG", "TAM1", "TAM2", "MAC")
+otherCells=c("EC", "VSMC", "PC", "Meninges","EPC")
+precursorCells=c("NSC", "NB", "OPC", "COP", "TAC")
+
+timePoints=c("Control", "EarlyPhase", "IntermediatePhase", "LatePhase", "Tumor")
+cellTypes=c(neuralCells, immuneCells, otherCells)
+
+
+timePointsToFilterOut=c()
+cellTypesToFilterOut=c("CC1", "CC2", "CC3", "CC4")
+
+
+setwd("/home/dcha/glioblastoma/hClust")
+
+timeCellCount=read.table("total.var.CPM_controlIncluded_timeCell_filter10_Avg.txt", header=T, sep="\t", row.names=1)
+
+timeCellCount$timePoint=timeCellCount %>% rownames(.) %>% strsplit("-") %>% lapply(., function(x) x[[1]]) %>% as.character() %>% factor(., levels=timePoints)
+timeCellCount$cellType=timeCellCount %>% rownames(.) %>% strsplit("-") %>% lapply(., function(x) x[[2]]) %>% as.character() %>% factor(., levels=cellTypes)
+
+timeCellCountFiltered = timeCellCount %>% dplyr::filter(!(cellType %in% cellTypesToFilterOut))
+timeCellCountFiltered = timeCellCountFiltered %>% dplyr::filter(!(timePoint %in% timePointsToFilterOut))
+
+timeCellCountFiltered$cellType = timeCellCountFiltered$cellType %>% droplevels(.)
+timeCellCountFiltered$timePoint = timeCellCountFiltered$timePoint %>% droplevels(.)
+
+#timeCellCountFiltered = timeCellCountFiltered %>% arrange(cellType) %>% arrange(timePoint)
+
+matTimeCell=timeCellCountFiltered %>% .[,c(-(ncol(.)-1), -ncol(.))]  %>% as.matrix()
+
+pccTimeCell=cor(matTimeCell %>% t(.), method="pearson")
+pccTimeCellHClust = hclust(Dist(matTimeCell, method="pearson"), method="complete")
+pccTimeCellOrder = pccTimeCellHClust$order
+pccTimeCell = pccTimeCell[pccTimeCellOrder, pccTimeCellOrder]
+timeCellCountFiltered = timeCellCountFiltered[pccTimeCellOrder,]
+
+
+#col_timePoint=qualitative_hcl(timeCellCountFiltered$timePoint %>% levels(.) %>% length(.),palette="Set 2")
+col_timePoint=brewer.pal(timeCellCountFiltered$timePoint %>% levels(.) %>% length(.), "RdPu")
+names(col_timePoint) = timeCellCountFiltered$timePoint %>% levels(.)
+
+#col_cellType=diverge_hsv(timeCellCountFiltered$cellType %>% levels(.) %>% length(.))
+#ctNum=timeCellCountFiltered$cellType %>% levels(.) %>% length(.)
+#col_cellType = colorRamps::matlab.like2(ctNum+20)[-c(2,3,5,6,8,9,11,12,14,15,16,17,18,19,20,22,24,26,28,30)]
+#names(col_cellType) = timeCellCountFiltered$cellType %>% levels(.)
+
+col_cellType = c("preCC1"= '#F8766D', "preCC2"= '#ad180e', "CC1"='#cf9c63', "CC2"= '#de7b37', "CC3"='#d1c630', "CC4"='#8FAA00', "NSC"= '#edeb53', "TAC"= '#66d99c', "NB"= '#00bc59', "Neuron"= '#038741', "OPC"= '#00BADE', "COP"= '#2194db', "OL"='#2f3bbd', "EPC"= '#737372', "EC"='#B385FF', "PC"= '#D874FD', "VSMC"='#EF67EB', "MAC"='#f5bfd0', "MG"='#d1889f', "TAM1"= '#ad4565', "TAM2"= '#992c4e', "Meninges"='#360816')
+
+ 
+
+
+
+col_tpct=list("TimePoint"=col_timePoint, "CellType"=col_cellType)
+
+annotTimeCell=HeatmapAnnotation(
+  TimePoint = timeCellCountFiltered$timePoint, 
+  CellType = timeCellCountFiltered$cellType,
+  col = col_tpct,
+  annotation_name_side ="left"
+)
+
+Heatmap(pccTimeCell, name = "Pearson R", row_names_side = "left", 
+        top_annotation = annotTimeCell, show_row_names = F, show_column_names = F, cluster_columns=F,cluster_rows=F)
+plot(pccTimeCellHClust, hang=-1)
+```
+
